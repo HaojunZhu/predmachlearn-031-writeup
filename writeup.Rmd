@@ -1,0 +1,190 @@
+---
+title: "predmachlearn-031 writeup"
+author: "Caleb Moore"
+date: "August 23, 2015"
+output: html_document
+---
+
+```{r, echo=FALSE,message=FALSE,warning=F}
+library(doParallel)
+library(caret)
+library(plyr)
+library(dplyr)
+```
+
+##Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project, the goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to predict the manner in which they performed a number of excercises. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+##Data 
+
+The training data for this project are available here: 
+
+- https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here: 
+
+- https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data contains a large number of variables including actual sensor data and aggregated summary information. Before attempting to run a machine learning algorithm, I cleaned up the following categories of variables:
+
+1. Calculated aggregations and summary rows (cases with the variable new_window set to 'true'). While some of these data points may be interesting, the test set does not contain data for these variables, so including them in the training set doesn't make sense.
+2. Variables that contain near zero variance. These viariables do not contain information that contribute to the classification, but can cause extra work for the training algorithm.
+3. Variables that have over 95% NA values. These variables might have information that would contribute to the classification, but we don't have enough cases to justify including them. Moreover, the test set contained NA values for these variables as well. 
+4. Variables that are highly correlated with eachother. These variables essentially produce a duplicate signal which adds complexity to the model without improving accuracy. For each pair of correlated variables, I discarded the variable that is more correlated with the other variables in the dataset. 
+
+After examining the resulting dataset, I imputed any remaining NA values to 0. Zero is reasonable in this case because the remaining variables are sensors that report relative movements on the x, y, and z axis. In context, a value of 0 would represent no movement.
+
+```{r}
+
+training<-read.csv('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv',stringsAsFactors = F)
+testing<-read.csv('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv',stringsAsFactors = F)
+
+# Remove rollup summary rows
+t.1<-training%>%filter(new_window=='no')
+# Remove ID, user, and time variables
+t.2<-t.1[8:length(t.1)]
+# Remove aggregated values included in the dataset
+aggs<-c('max_','min_','avg_','stddev_','var_','kurtosis_','skewness_')
+t.2<-t.2[,!grepl(paste('(',aggs,')',collapse = '|',sep=''),names(t.2))]
+
+# Remove variables that contain near 0 variance
+nzv<-nearZeroVar(t.2)
+t.3<-t.2[,-nzv]
+# Remove variables with > 95% null values
+t.3<-t.3[,sapply(t.3, function(x) sum(is.na(x)))/nrow(t.3)<=.95]
+
+# Remove variables that cannot be parsed as numbers
+preds<-t.3[,sapply(t.3,class)!='character']
+
+# Make the response variable a factor
+resp<-factor(t.3$classe)
+
+# At this point we should be down to just the sensor values. Impute any remaining missing values to 0
+for(i in 1:length(preds)){
+  preds[,i]<-ifelse(is.na(preds[,i]),0,preds[,i])
+}
+
+# Find and remove predictors that are highly correlated with eachother. 
+correlated<-findCorrelation(cor(preds), .9)
+preds<-preds[,-correlated]
+```
+
+##Modeling
+
+Because the data is composed of numeric predictors with a categorical response variable, I chose to evaluate the following models:
+
+1. Random Forest - The random forest algorithm can produce extremely accurate models capable of learning non-linear decision boundries with very little tuning. Because of these properties it is often used as a benchmark to which other models are compared.
+2. Boosted Tree - Boosting is a common technique used to combine several weak learners to create a stronger learner. Boosted decision trees provide many of the same benifits as random forests, but require tuning to avoid overfitting. 
+3. Regularized Linear Models -  Linear regression models are among the oldest statistical learning algorithms. Support vector machines are an extension of the concept of linear models to higher order dimensional space. Both techniques can produce very accurate models, but are restricted to learning linear decision boundries. LiblineaR provides a fast implimentation of a number of linear models including basic regression and SVM classifiers. L1 and L2 regularization can be applied to both regression and SVM models. 
+
+Because tree based models in general do not require centered, scaled data I did not perform that preprocessing step to the entire dataset. Instead I passed the preprocessing opertaions as a parameter to caret's train function for the models that benifit from centering and scaling.
+
+To evaluate the models, I split the training data into a training set and a validation set using stratified sampling without replacement on the response variable. I used 80% of the data to train and 20% to validate. 
+
+
+
+```{r}
+set.seed(125)
+
+# Split the data into train and test sets with 80% going into the test set
+train.idx<-createDataPartition(resp,times = 1,p = .8,list = T)$Resample1
+test.idx<-seq_along(resp)[-1*train.idx]
+
+# Save the processed data
+save(list=c('preds','resp','testing','training','train.idx','test.idx'),
+     file='all.data.RData')
+```
+
+Next I used caret to select the best hyper-parameters using 5-fold cross validation and a grid searh. The combination of a grid search and 5-fold cross validation can lead to very long training time. To speed up the process, I configured caret to run in parallel and executed the learning algorithms on an compute-optimized 8-core virtual server with 30GB of RAM hosted in Microsoft Azure. 
+
+Because of the extended training time, the R code to generate the the models is commented out below. You can find the resulting .rds file in the repo along side this document.
+
+```{r}
+# stopImplicitCluster()
+# registerDoParallel() #(cores = 7)
+# getDoParWorkers()
+
+# Setup 5 fold cross validation on the training set
+tc<-trainControl(method='cv',allowParallel=T,number=5)
+
+# Random forest almost always produces a good model with very little tuning required
+# fit.rf<-train(x=preds[train.idx,],y=resp[train.idx],method='rf',tuneLength=3)
+# fit.rf.cm<-confusionMatrix(predict(fit.rf,newdata = preds[test.idx,]),resp[test.idx])
+# saveRDS(fit.rf,'fit.rf.rds');saveRDS(fit.rf.cm,'fit.rf.cm.rds');
+
+# Boosted trees. Stochatic gradient boosting
+# fit.gbm<-train(x=preds[train.idx,],y=resp[train.idx],method='gbm',trControl=tc,tuneLength=5)
+# fit.gbm.cm<-confusionMatrix(predict(fit.gbm,newdata = preds[test.idx,]),resp[test.idx])
+# saveRDS(fit.gbm,'fit.gbm.rds');saveRDS(fit.gbm.cm,'fit.gbm.cm.rds');
+```
+
+LiblineaR does not have a native caret interface. For a fair comparison, I wrote a custom caret learner that plugs into the same framework as the other models I evaluated.
+
+```{r}
+# A variety of linear models provided by lib linear
+modelInfo <- list(label = "LiblineaR",
+                  library = "LiblineaR",
+                  type = c("Classification"),
+                  parameters = data.frame(parameter = c('c','t'),
+                                          class =     c('numeric','numeric'),
+                                          label =     c('c','type')),
+                  grid = function(x, y, len = NULL, search = "grid") {
+                    library(LiblineaR)
+                    C<-heuristicC(as.matrix(x))
+                    if(!(is.null(len) | len==1)){
+                      C<-seq(C/2,C*2,length.out = len)
+                    }
+                    data.frame(expand.grid(
+                      c=C,
+                      t=c(0,1,2,3,4,5,6,7)))
+                  },
+                  loop = NULL,
+                  fit = function(x, y, wts, param, lev, last, classProbs, ...) {
+                    library(LiblineaR)
+                    
+                    m<-LiblineaR(
+                      data=as.matrix(x),target=y,
+                      type=param[['t']],
+                      cost=param[['c']],
+                      epsilon=NULL,
+                      verbose = F)
+                    m
+                  },
+                  predict = function(modelFit, newdata, submodels = NULL) {
+                    unlist(predict(modelFit, as.matrix(newdata)))
+                  },
+                  prob = NULL,
+                  tags = c("Support Vector Machines","Linear Regression", "Linear Classifier"))
+
+# fit.ll<-train(x=preds[train.idx,],y=resp[train.idx],method=modelInfo,trControl=tc,preProcess = c('center','scale'),tuneLength = 5)
+# fit.ll.cm<-confusionMatrix(predict(fit.ll,newdata = preds[test.idx,]),resp[test.idx])
+# saveRDS(fit.ll,'fit.ll.rds');saveRDS(fit.ll.cm,'fit.ll.cm.rds')
+```
+
+I compared the models performance on the test set using both the accuracy metric, and the Kappa metric. The randomForest model and the gbm model both performed very well at about 99% accuracy. 
+
+```{r}
+# matrix(c(fit.rf.cm$overall['Accuracy'] ,fit.rf.cm$overall['Kappa'],
+#          fit.gbm.cm$overall['Accuracy'],fit.gbm.cm$overall['Kappa'],
+#          fit.ll.cm$overall['Accuracy'] ,fit.ll.cm$overall['Kappa']),
+#        nrow = 3,ncol = 2,byrow = T,
+#        dimnames = list(c('randomForest','gbm','LiblineaR'),
+#                        c('Accuracy','Kappa')))
+
+#               Accuracy     Kappa
+# randomForest 0.9906274 0.9881411
+# gbm          0.9877636 0.9845190
+# LiblineaR    0.7123145 0.6340022
+```
+
+Because random forests are less prone to overfitting than boosted models, I chose to use the random forest model for my submission.
+
+```{r}
+test.2<-testing[,names(preds)]
+# predict(fit.rf, newdata=test.2)
+
+# [1] B A B A A E D B A A B C B A E E A B B B
+```
